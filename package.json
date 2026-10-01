@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "export:bandung": "node scripts/export-bandung-data.mjs",
+    "query-tool": "node server/queryTravelPlaces.mjs"
   },
   "dependencies": {
     "framer-motion": "^11.0.3",

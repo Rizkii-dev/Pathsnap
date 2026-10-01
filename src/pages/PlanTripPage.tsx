@@ -105,14 +105,19 @@ const PlanTripPage: React.FC = () => {
 
   const handleApplyPlan = (plan: TripPlanResponse) => {
     const plannedRoute = plan.stops.flatMap(stop => {
-      const destination = destinations.find(item =>
-        item.name.toLowerCase() === stop.destination.toLowerCase(),
-      );
-      const accommodation = accommodations.find(item =>
-        item.name.toLowerCase() === stop.hotel.toLowerCase() && item.destinationId === destination?.id,
-      );
+      const stopName = stop.destination.toLowerCase();
+      const destination = destinations.find(item => item.name.toLowerCase() === stopName)
+        || destinations.find(item => stopName.includes(item.name.toLowerCase()) || item.name.toLowerCase().includes(stopName));
+      if (!destination) {
+        console.warn('[applyPlan] no matching destination for', stop.destination);
+        return [];
+      }
 
-      if (!destination) return [];
+      const accommodation = stop.hotel
+        ? accommodations.find(item =>
+            item.name.toLowerCase() === stop.hotel!.toLowerCase() && item.destinationId === destination.id,
+          )
+        : undefined;
 
       return [{
         id: generateUniqueId(),
@@ -120,9 +125,14 @@ const PlanTripPage: React.FC = () => {
         destinationId: destination.id,
         selectedAccommodationId: accommodation?.id,
         selectedAttractions: [],
-        stayDuration: stop.nights,
+        // Day visits have nights=0 but still occupy one day on the route.
+        stayDuration: Math.max(1, stop.nights),
       }];
     });
+
+    if (plannedRoute.length === 0 && plan.stops.length > 0) {
+      console.warn('[applyPlan] none of the plan stops matched catalog destinations', plan.stops.map(s => s.destination));
+    }
 
     setSelectedDestinations(currentRoute => {
       const existingDestinationIds = new Set(currentRoute.map(routePoint => routePoint.destinationId));
