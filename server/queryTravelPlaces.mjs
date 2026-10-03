@@ -8,12 +8,14 @@
  * POST /api/query-travel-places
  *   { budgetUsd, userLocation, travelArea, days }
  */
+import pg from 'pg';
 import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+const { Pool } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
 const PORT = Number(process.env.QUERY_TOOL_PORT || 8787);
@@ -22,6 +24,31 @@ const PORT = Number(process.env.QUERY_TOOL_PORT || 8787);
 const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
 const geocodeCache = new Map();
 let lastGeocodeAt = 0;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  }
+});
+
+async function queryDatabase(sql, params = []) {
+  const result = await pool.query(sql, params);
+  return result.rows;
+}
+
+const sql = `
+  SELECT * FROM places
+  LIMIT 100`;
+
+try {
+  const rows = await queryDatabase(sql);
+
+  conse.log(rows); 
+} catch (error) {
+  console.error('Error querying the database:', error);
+} finally {
+  await pool.end();
+}
 
 /**
  * Geocode a free-text address via Nominatim (OpenStreetMap).
