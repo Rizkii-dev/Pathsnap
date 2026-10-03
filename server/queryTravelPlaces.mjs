@@ -566,7 +566,6 @@ const server = createServer(async (req, res) => {
   sendJson(res, 404, { error: 'Not found' });
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`query_travel_places tool server on http://127.0.0.1:${PORT}`);
-  console.log('POST /api/query-travel-places { budgetUsd, userLocation, travelArea, days }');
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
 });
