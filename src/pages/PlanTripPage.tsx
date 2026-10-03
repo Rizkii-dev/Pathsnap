@@ -2,9 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
 import MapView from '../components/planner/MapView';
 import RouteSidebar from '../components/planner/RouteSidebar';
+import AITripAssistant from '../components/planner/AITripAssistant';
 import { destinations, accommodations, attractions } from '../data/mockData';
 import { RoutePoint, Destination } from '../types';
 import { generateUniqueId, calculateTotalCost, calculateTotalDuration } from '../utils/helpers';
+import { TripPlanResponse } from '../components/planner/AITripAssistant';
 
 const PlanTripPage: React.FC = () => {
   const location = useLocation();
@@ -100,6 +102,52 @@ const PlanTripPage: React.FC = () => {
     
     setSelectedDestinations(updatedDestinations);
   };
+
+  const handleApplyPlan = (plan: TripPlanResponse) => {
+    const plannedRoute = plan.stops.flatMap(stop => {
+      const stopName = stop.destination.toLowerCase();
+      const destination = destinations.find(item => item.name.toLowerCase() === stopName)
+        || destinations.find(item => stopName.includes(item.name.toLowerCase()) || item.name.toLowerCase().includes(stopName));
+      if (!destination) {
+        console.warn('[applyPlan] no matching destination for', stop.destination);
+        return [];
+      }
+
+      const accommodation = stop.hotel
+        ? accommodations.find(item =>
+            item.name.toLowerCase() === stop.hotel!.toLowerCase() && item.destinationId === destination.id,
+          )
+        : undefined;
+
+      return [{
+        id: generateUniqueId(),
+        order: 0,
+        destinationId: destination.id,
+        selectedAccommodationId: accommodation?.id,
+        selectedAttractions: [],
+        // Day visits have nights=0 but still occupy one day on the route.
+        stayDuration: Math.max(1, stop.nights),
+      }];
+    });
+
+    if (plannedRoute.length === 0 && plan.stops.length > 0) {
+      console.warn('[applyPlan] none of the plan stops matched catalog destinations', plan.stops.map(s => s.destination));
+    }
+
+    setSelectedDestinations(currentRoute => {
+      const existingDestinationIds = new Set(currentRoute.map(routePoint => routePoint.destinationId));
+      const newRoutePoints = plannedRoute.filter(routePoint => {
+        if (existingDestinationIds.has(routePoint.destinationId)) return false;
+        existingDestinationIds.add(routePoint.destinationId);
+        return true;
+      });
+
+      return [...currentRoute, ...newRoutePoints].map((routePoint, index) => ({
+        ...routePoint,
+        order: index,
+      }));
+    });
+  };
   
   return (
     <div className="container mx-auto px-4 py-8">
@@ -118,19 +166,28 @@ const PlanTripPage: React.FC = () => {
             onDestinationSelect={handleAddDestination}
           />
         </div>
-        <div className="h-[600px]">
-          <RouteSidebar 
+        <div className="flex flex-col gap-6">
+          <AITripAssistant
             selectedDestinations={selectedDestinations}
             destinations={destinations}
             accommodations={accommodations}
             attractions={attractions}
-            onRemoveDestination={handleRemoveDestination}
-            onUpdateDuration={handleUpdateDuration}
-            onSelectAccommodation={handleSelectAccommodation}
-            onToggleAttraction={handleToggleAttraction}
-            totalCost={totalCost}
-            totalDuration={totalDuration}
+            onApplyPlan={handleApplyPlan}
           />
+          <div className="h-[600px]">
+            <RouteSidebar 
+              selectedDestinations={selectedDestinations}
+              destinations={destinations}
+              accommodations={accommodations}
+              attractions={attractions}
+              onRemoveDestination={handleRemoveDestination}
+              onUpdateDuration={handleUpdateDuration}
+              onSelectAccommodation={handleSelectAccommodation}
+              onToggleAttraction={handleToggleAttraction}
+              totalCost={totalCost}
+              totalDuration={totalDuration}
+            />
+          </div>
         </div>
       </div>
     </div>

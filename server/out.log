@@ -1,0 +1,52 @@
+query_travel_places tool server on http://127.0.0.1:8787
+POST /api/query-travel-places { budgetUsd, userLocation, travelArea, days }
+[query_travel_places] args: {
+  budgetUsd: 200,
+  userLocation: 'taman holis',
+  travelArea: 'Bandung',
+  days: 1
+}
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: {
+  budgetUsd: 200,
+  userLocation: 'taman holis',
+  travelArea: 'Bandung',
+  days: 1
+}
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: { budgetUsd: 200, userLocation: '', travelArea: 'Bandung', days: 3 }
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: { budgetUsd: 200, userLocation: '', travelArea: 'Bandung', days: 3 }
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: { budgetUsd: 200, userLocation: '', travelArea: 'Bandung', days: 3 }
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: { budgetUsd: 200, userLocation: '', travelArea: 'Bandung', days: 3 }
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: { budgetUsd: 200, userLocation: '', travelArea: 'Bandung', days: 3 }
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: { budgetUsd: 200, userLocation: '', travelArea: 'Bandung', days: 3 }
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: {
+  budgetUsd: 200,
+  userLocation: 'Taman Holis',
+  travelArea: 'Bandung',
+  days: 3,
+  tripType: 'vacation'
+}
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: {
+  budgetUsd: 200,
+  userLocation: 'Taman Holis',
+  travelArea: 'Bandung',
+  days: 1,
+  tripType: 'short'
+}
+[query_travel_places] returned 80 places (top 15 kept)
+[query_travel_places] args: {
+  budgetUsd: 200,
+  userLocation: 'Taman Holis',
+  travelArea: 'Bandung',
+  days: 1,
+  tripType: 'short'
+}
+[query_travel_places] returned 80 places (top 15 kept)

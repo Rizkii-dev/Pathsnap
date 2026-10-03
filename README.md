@@ -1,45 +1,14 @@
 # Pathsnap
 
-**Pathsnap** is an interactive travel planning and route optimization application designed to help travelers discover destinations, create customized itineraries, and visualize routes on an interactive map.
+## Local setup
 
----
+Install dependencies and start the app:
 
-## 🚀 Features
+```bash
+npm install
+npm run dev
+```
 
-* **Interactive Trip Planner:** Build custom trip routes with real-time map visualization and itinerary management.
-* **Destination Discovery:** Explore curated destinations with filtering options based on preferences, activities, and regions.
-* **Detailed Destination Guides:** View comprehensive information, highlight points of interest, and reviews for featured spots.
-* **Responsive Layout:** Modern, mobile-friendly UI built with Tailwind CSS.
+The optional AI trip assistant on the planner page uses Groq. Copy `.env.example` to `.env.local` and add your Groq API key as `VITE_GROQ_API_KEY` before starting the dev server. The key is read only from the environment and is not committed to the repository.
 
----
-
-## 🛠 Tech Stack & Architecture
-
-* **Framework / Library:** React, TypeScript
-* **Build Tool:** Vite
-* **Styling:** Tailwind CSS, PostCSS
-* **Code Quality:** ESLint
-
----
-
-## 📂 Repository Structure
-
-```text
-Pathsnap/
-├── src/
-│   ├── components/
-│   │   ├── destinations/   # Filter bars, cards, and list views
-│   │   ├── home/           # Hero sections, featured spots, and testimonials
-│   │   ├── layout/         # Header, Footer, and navigation wrappers
-│   │   ├── planner/        # Interactive MapView and RouteSidebar components
-│   │   └── ui/             # Reusable UI elements (Buttons, Cards, Modals)
-│   ├── data/               # Mock data sources and static assets
-│   ├── pages/              # Application pages (Home, PlanTrip, Destinations, Contact)
-│   ├── types/              # TypeScript definitions and interfaces
-│   └── utils/              # Helper functions and utilities
-├── eslint.config.js        # ESLint configuration
-├── index.html              # HTML entry point
-├── package.json            # Project dependencies and scripts
-├── tailwind.config.js      # Tailwind CSS configuration
-├── tsconfig.json           # TypeScript setup
-└── vite.config.ts          # Vite build configuration
+Because this is currently a Vite frontend, the key is exposed to the browser at runtime. Use a server-side proxy or backend endpoint before deploying this integration publicly.
