@@ -1,12 +1,16 @@
 import React, { useState } from 'react';
-import { Bot, Send, Sparkles, X } from 'lucide-react';
-import { Accommodation, Attraction, Destination, RoutePoint } from '../../types';
+import { useNavigate } from 'react-router-dom';
+import { Bot, Send, Sparkles, X, ExternalLink, Star } from 'lucide-react';
+import { Accommodation, Attraction, Destination, RoutePoint, UserLocation } from '../../types';
+import { findDestinationByName, haversineMeters, isWithinRadius } from '../../utils/helpers';
 
 interface AITripAssistantProps {
   selectedDestinations: RoutePoint[];
   destinations: Destination[];
   accommodations: Accommodation[];
   attractions: Attraction[];
+  userLocation: UserLocation | null;
+  radiusMeters: number;
   onApplyPlan: (plan: TripPlanResponse) => void;
 }
 
@@ -37,6 +41,8 @@ export interface TripPlanResponse {
   notes: string[];
 }
 
+type PlanStop = TripPlanResponse['stops'][number];
+
 interface ShortlistedPlace {
   name: string;
   avgAccommodationPrice: number | null;
@@ -49,6 +55,9 @@ interface ShortlistedPlace {
   sameArea: boolean;
   distanceKm: number | null;
   affordableAttractions: boolean;
+  /** Set client-side from user GPS + radius — used to prioritize nearby places. */
+  inRadius?: boolean;
+  coordinates?: [number, number] | null;
 }
 
 interface QueryTravelPlacesResult {
@@ -87,6 +96,94 @@ const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'qwen/qwen3.8-27b';
 const QUERY_TOOL_URL = '/api/query-travel-places';
 
+/** Free-tier Groq ITPM is tiny — keep every prompt compact and retry when the bucket is full. */
+const MAX_PROMPT_PLACES = 12;
+const MAX_GROQ_RETRIES = 4;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const parseRetryAfterMs = (errorBody: string): number => {
+  const match = errorBody.match(/try again in ([\d.]+)s/i);
+  if (match) return Math.ceil(parseFloat(match[1]) * 1000) + 300;
+  return 2000;
+};
+
+/** Skip the Groq intent call for obvious requests — saves ITPM right before the big plan request. */
+const detectLocalIntent = (question: string): ConversationIntent['action'] | null => {
+  const q = question.toLowerCase();
+  if (/\b(route|itinerary|trip plan|plan my|plan a|plan the|make me a|build (me )?a|create (me )?a|generate (me )?a)\b/.test(q)) {
+    return 'plan';
+  }
+  if (/\b(hi|hello|hey|thanks|thank you|ok|okay)\b/.test(q) && q.length < 40) {
+    return 'chat';
+  }
+  return null;
+};
+
+const formatGroqError = (body: string, status: number, step: string): string => {
+  try {
+    const parsed = JSON.parse(body) as { error?: { message?: string; code?: string } };
+    const message = parsed?.error?.message || body;
+    if (
+      status === 429 ||
+      parsed?.error?.code === 'rate_limit_exceeded' ||
+      /rate.?limit|tokens per minute|itpm/i.test(message)
+    ) {
+      return 'The AI service hit its free-tier token rate limit. Wait a few seconds and send the request again.';
+    }
+    return message || `${step} failed with status ${status}`;
+  } catch {
+    return body || `${step} failed with status ${status}`;
+  }
+};
+
+/** POST to Groq with rate-limit retry so ITPM bursts do not surface as raw errors. */
+const fetchGroq = async (
+  apiKey: string,
+  payload: Record<string, unknown>,
+  step: string,
+): Promise<{ choices?: Array<{ message?: { content?: string | null; tool_calls?: unknown[] } }> }> => {
+  let lastError = '';
+  let lastStatus = 0;
+
+  for (let attempt = 1; attempt <= MAX_GROQ_RETRIES; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(GROQ_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      throw new Error('Unable to reach the AI service. Check your connection and try again.');
+    }
+
+    if (response.ok) {
+      return response.json();
+    }
+
+    lastError = await response.text();
+    lastStatus = response.status;
+    const isRateLimit =
+      response.status === 429 ||
+      /rate.?limit|tokens per minute|itpm|try again in/i.test(lastError);
+
+    if (isRateLimit && attempt < MAX_GROQ_RETRIES) {
+      const waitMs = parseRetryAfterMs(lastError);
+      console.warn(`[Groq ${step}] rate limited, retrying in ${waitMs}ms (attempt ${attempt}/${MAX_GROQ_RETRIES})`);
+      await sleep(waitMs);
+      continue;
+    }
+
+    throw new Error(formatGroqError(lastError, response.status, step));
+  }
+
+  throw new Error(formatGroqError(lastError, lastStatus, step));
+};
+
 const QUERY_TRAVEL_PLACES_TOOL = {
   type: 'function' as const,
   function: {
@@ -111,6 +208,15 @@ const QUERY_TRAVEL_PLACES_TOOL = {
         days: {
           type: 'integer',
           description: 'Number of vacation days.',
+        },
+        userCoords: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Optional [lat, lng] of the traveler. Prefer this over geocoding userLocation.',
+        },
+        radiusMeters: {
+          type: 'number',
+          description: 'Prioritization radius in meters around the traveler.',
         },
       },
       required: ['budgetUsd', 'userLocation', 'travelArea', 'days'],
@@ -180,7 +286,7 @@ const validateTripPlan = (
     );
   };
 
-  const validatedStops = plan.stops.flatMap(stop => {
+  const validatedStops = plan.stops.flatMap((stop): PlanStop[] => {
     const rawName = String(stop.destination || '').trim();
     if (!rawName) return [];
 
@@ -243,13 +349,13 @@ const validateTripPlan = (
   });
 
   const budget = typeof plan.budgetUsd === 'number' ? plan.budgetUsd : null;
-  let stops = validatedStops;
+  let stops: PlanStop[] = validatedStops;
 
   // Day-trip models sometimes put the itinerary only in notes. Recover those visits
   // so "Add plan to Your Route" still has stops to apply.
   if (stops.length === 0 && plan.notes.length > 0) {
     const notesText = plan.notes.join(' ').toLowerCase();
-    const recovered = shortlist
+    const recovered: PlanStop[] = shortlist
       .filter(place => notesText.includes(place.name.toLowerCase()))
       .filter(place => !isStartingLocation(place.name))
       .map(place => ({
@@ -287,29 +393,82 @@ const formatUsd = (amount: number): string => `$${amount.toLocaleString('en-US',
   maximumFractionDigits: 2,
 })}`;
 
+/** Places inside the radius first, then by distance — so the model sees priority order. */
+const sortPlacesForPrompt = (places: ShortlistedPlace[]): ShortlistedPlace[] => {
+  return [...places].sort((a, b) => {
+    const aIn = a.inRadius ? 0 : 1;
+    const bIn = b.inRadius ? 0 : 1;
+    if (aIn !== bIn) return aIn - bIn;
+    const da = a.distanceKm ?? Number.POSITIVE_INFINITY;
+    const db = b.distanceKm ?? Number.POSITIVE_INFINITY;
+    if (da !== db) return da - db;
+    return (b.rating ?? -1) - (a.rating ?? -1);
+  });
+};
+
 const formatShortlistForPrompt = (places: ShortlistedPlace[]): string => {
   if (places.length === 0) return '(no places returned)';
-  return places
+  return sortPlacesForPrompt(places)
+    .slice(0, MAX_PROMPT_PLACES)
     .map((place, index) => {
       const parts = [
         `${index + 1}. ${place.name}`,
+        place.inRadius ? 'PRIORITY_IN_RADIUS' : null,
         place.avgTotalPrice != null ? `avgTotal=${formatUsd(place.avgTotalPrice)}` : null,
         place.avgAccommodationPrice != null ? `avgStay=${formatUsd(place.avgAccommodationPrice)}` : null,
         place.rating != null ? `rating=${place.rating}` : null,
-        place.sameArea ? `nearYou${place.distanceKm != null ? ` (${place.distanceKm}km)` : ''}` : null,
+        place.distanceKm != null ? `dist=${place.distanceKm}km` : null,
       ].filter(Boolean);
       return parts.join(' | ');
     })
     .join('\n');
 };
 
+type HotelArea = {
+  destination: string;
+  country: string;
+  hotels: Array<{ name: string; pricePerNight: number; rating: number | null }>;
+};
+
+/** One line per place — far smaller than JSON.stringify on nested hotel objects. */
+const formatHotelsForPrompt = (hotelData: HotelArea[]): string => {
+  if (hotelData.length === 0) return '(no hotels)';
+  return hotelData
+    .slice(0, MAX_PROMPT_PLACES)
+    .map(area => {
+      const hotels = area.hotels
+        .slice(0, 8)
+        .map(hotel => {
+          const rating = hotel.rating != null ? `, ${hotel.rating}` : '';
+          return `${hotel.name} ($${hotel.pricePerNight}/night${rating})`;
+        })
+        .join('; ');
+      return `${area.destination}: ${hotels || '(none)'}`;
+    })
+    .join('\n');
+};
+
+/** Slim place objects for tool results / validation — drop fields the model does not need. */
+const compactPlacesForPrompt = (places: ShortlistedPlace[]) =>
+  sortPlacesForPrompt(places).slice(0, MAX_PROMPT_PLACES).map(place => ({
+    name: place.name,
+    avgTotalPrice: place.avgTotalPrice,
+    avgAccommodationPrice: place.avgAccommodationPrice,
+    rating: place.rating,
+    inRadius: place.inRadius ?? false,
+    distanceKm: place.distanceKm,
+  }));
+
 const AITripAssistant: React.FC<AITripAssistantProps> = ({
   selectedDestinations,
   destinations,
   accommodations,
   attractions,
+  userLocation,
+  radiusMeters,
   onApplyPlan,
 }) => {
+  const navigate = useNavigate();
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -324,7 +483,7 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: 'assistant',
-      content: 'Hi! Set your budget, location, travel area, days, and trip type, then ask a question. Short trips keep routes light (3–5 hours); vacations allow fuller days.',
+      content: 'Hi! Set your budget, travel area, days, and trip type, then ask a question. Use the location controls above for GPS + priority radius — nearby places are highlighted and preferred. Short trips keep routes light (3–5 hours); vacations allow fuller days.',
     },
   ]);
 
@@ -333,12 +492,17 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
   const parseQueryForm = () => {
     const budgetUsd = Number(queryForm.budgetUsd);
     const days = Number(queryForm.days);
+    // Prefer GPS/map coords + label when available; fall back to typed text.
+    const anchorLabel = userLocation?.label?.trim() || queryForm.userLocation.trim();
     return {
       budgetUsd: Number.isFinite(budgetUsd) && budgetUsd > 0 ? budgetUsd : 0,
-      userLocation: queryForm.userLocation.trim(),
+      userLocation: anchorLabel,
       travelArea: queryForm.travelArea.trim() || 'Bandung',
       days: Number.isFinite(days) && days > 0 ? Math.floor(days) : 1,
       tripType: queryForm.tripType,
+      // Exact coords skip geocoding on the query tool and enable radius ranking.
+      userCoords: userLocation?.coords ?? null,
+      radiusMeters: Math.round(radiusMeters),
     };
   };
 
@@ -347,6 +511,8 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
     userLocation: string;
     travelArea: string;
     days: number;
+    userCoords?: [number, number] | null;
+    radiusMeters?: number;
   }): Promise<QueryTravelPlacesResult> => {
     logAiRequest('mcp-query_travel_places', params);
 
@@ -402,9 +568,36 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
     };
   });
 
+  /** Attach distance / inRadius from the traveler's GPS anchor when available. */
+  const annotateWithRadius = (places: ShortlistedPlace[]): ShortlistedPlace[] => {
+    const origin = userLocation?.coords;
+    if (!origin) {
+      return places.map(place => ({ ...place, inRadius: false, coordinates: place.coordinates ?? null }));
+    }
+
+    return places.map(place => {
+      const coords =
+        place.coordinates ??
+        destinations.find(d => d.name.toLowerCase() === place.name.toLowerCase())?.coordinates ??
+        null;
+
+      if (!coords) {
+        return { ...place, inRadius: false, coordinates: null };
+      }
+
+      const meters = haversineMeters(origin, coords);
+      return {
+        ...place,
+        coordinates: coords,
+        distanceKm: Math.round((meters / 1000) * 100) / 100,
+        inRadius: isWithinRadius(origin, coords, radiusMeters),
+      };
+    });
+  };
+
   /** Local catalog fallback when the MCP place query is down — names + rough prices only. */
   const buildLocalShortlist = (): ShortlistedPlace[] => {
-    return destinations.map(destination => {
+    return annotateWithRadius(destinations.map(destination => {
       const destHotels = accommodations.filter(item => item.destinationId === destination.id);
       const destAttractions = attractions.filter(item => item.destinationId === destination.id);
       const avgAcc = destHotels.length > 0
@@ -425,20 +618,24 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
         sameArea: false,
         distanceKm: null,
         affordableAttractions: true,
+        coordinates: destination.coordinates,
+        inRadius: false,
       };
-    }).slice(0, 30);
+    }).slice(0, 30));
   };
 
   /** Hotels only for shortlisted destination names — keeps the plan payload small. */
-  const retrieveHotelsForShortlist = (shortlist: ShortlistedPlace[]) => {
-    const names = new Set(shortlist.map(item => item.name.toLowerCase()));
+  const retrieveHotelsForShortlist = (shortlist: ShortlistedPlace[]): HotelArea[] => {
+    const names = new Set(shortlist.slice(0, MAX_PROMPT_PLACES).map(item => item.name.toLowerCase()));
     return destinations
       .filter(destination => names.has(destination.name.toLowerCase()))
+      .slice(0, MAX_PROMPT_PLACES)
       .map(destination => ({
         destination: destination.name,
         country: destination.country,
         hotels: accommodations
           .filter(item => item.destinationId === destination.id)
+          .slice(0, 8)
           .map(item => ({
             name: item.name,
             pricePerNight: item.price,
@@ -459,26 +656,14 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
         },
         {
           role: 'user',
-          content: `Recent conversation:\n${JSON.stringify(messages.slice(-6).map(({ role, content }) => ({ role, content })))}\n\nNew message: ${question}`,
+          // Only the latest turn — history can wait for the chat/plan call.
+          content: `New message: ${question}`,
         },
       ],
     };
     logAiRequest('intent', payload);
 
-    const response = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      throw new Error((await response.text()) || `Intent detection failed with status ${response.status}`);
-    }
-
-    const data: { choices?: Array<{ message?: { content?: string } }> } = await response.json();
+    const data = await fetchGroq(apiKey, payload, 'intent');
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw new Error('Groq returned no conversation intent.');
 
@@ -497,7 +682,11 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
     // Names first — never dump full destination/attraction objects into the prompt.
     const namesBlock = shortlist.length > 0
       ? formatShortlistForPrompt(shortlist)
-      : destinations.slice(0, 30).map((item, index) => `${index + 1}. ${item.name}`).join('\n');
+      : destinations.slice(0, MAX_PROMPT_PLACES).map((item, index) => `${index + 1}. ${item.name}`).join('\n');
+
+    const routeLines = buildTripContext()
+      .map(stop => `${stop.stop}. ${stop.destination ?? '?'}${stop.stayDurationDays != null ? ` (${stop.stayDurationDays}d)` : ''}`)
+      .join('\n') || '(empty)';
 
     const payload = {
       model: GROQ_MODEL,
@@ -507,29 +696,16 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
           role: 'system',
           content: 'You are Pathsnap, a friendly travel destination assistant. Answer only travel-related questions. Use the supplied destination names (and compact prices when present). Do not invent specific facts, hotels, prices, or attractions that are not provided. If the context is insufficient, say so briefly. Keep the response under 120 words.',
         },
-        ...messages.slice(-6).map(({ role, content }) => ({ role, content })),
+        ...messages.slice(-4).map(({ role, content }) => ({ role, content })),
         {
           role: 'user',
-          content: `Destination names (from budget/location query):\n${namesBlock}\n\nCurrent route:\n${JSON.stringify(buildTripContext(), null, 2)}\n\nQuestion: ${question}`,
+          content: `Destination names (from budget/location query):\n${namesBlock}\n\nCurrent route:\n${routeLines}\n\nQuestion: ${question}`,
         },
       ],
     };
     logAiRequest('travel-chat', payload);
 
-    const response = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      throw new Error((await response.text()) || `Travel chat failed with status ${response.status}`);
-    }
-
-    const data: { choices?: Array<{ message?: { content?: string } }> } = await response.json();
+    const data = await fetchGroq(apiKey, payload, 'travel-chat');
     const answer = data.choices?.[0]?.message?.content;
     if (!answer) throw new Error('Groq returned an empty travel response.');
     return answer;
@@ -537,21 +713,31 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
 
   /**
    * Plan flow: Groq tool-calling → query_travel_places MCP tool → plan on shortlist names only.
+   * Payloads stay compact (names + prices only) to fit free-tier ITPM.
    */
   const requestTripPlanWithTools = async (
     question: string,
     formParams: ReturnType<typeof parseQueryForm>,
     shortlist: ShortlistedPlace[],
-    hotelData: ReturnType<typeof retrieveHotelsForShortlist>,
+    hotelData: HotelArea[],
   ): Promise<TripPlanResponse> => {
     const maxStops = maxStopsForTrip(formParams.tripType, formParams.days);
     const paceRule = formParams.tripType === 'short'
       ? `Trip type is a normal short trip (about 3–5 hours). Include AT MOST ${maxStops} stops total. Prefer 2–3 nearby places. Do not pack a full-day tour into a short outing.`
       : `Trip type is a vacation (${formParams.days} day${formParams.days === 1 ? '' : 's'}). Include at most ${maxStops} stops total, about 3 places per day, and allow realistic travel time between places.`;
 
-    const systemContent = `You are Pathsnap's trip planning engine. First call query_travel_places with the provided form parameters to retrieve shortlisted place names and prices. Then return exactly ONE JSON object, never an array, with no markdown or extra text. Use exactly this shape: {"planTitle":"string","budgetUsd":number|null,"durationDays":number|null,"totalEstimatedHotelCostUsd":number,"withinBudget":boolean|null,"stops":[{"destination":"string","country":"string","nights":number,"hotel":string|null,"pricePerNightUsd":number,"hotelTotalUsd":number}],"notes":["string"]}. ${paceRule} Every place the traveler will visit MUST appear in stops — including day trips and places with no overnight stay. For a day visit set nights to 0, hotel to null, pricePerNightUsd to 0, and hotelTotalUsd to 0. Only set a hotel name when booking an overnight stay. The userLocation is only the trip starting point — never list it in stops unless it is also in the shortlist. Use only exact destination and hotel names from the tool results and hotel list. Never invent places, hotels, amenities, or prices.`;
+    const radiusKm = (radiusMeters / 1000).toFixed(radiusMeters >= 1000 ? 1 : 2);
+    const radiusRule = userLocation?.coords
+      ? `The traveler's anchor is ${userLocation.label} at ${userLocation.coords[0]}, ${userLocation.coords[1]}. STRONGLY PRIORITIZE places marked PRIORITY_IN_RADIUS or inRadius=true (within ${radiusKm} km). Prefer those for stops first; only add outside-radius places when the route needs more options.`
+      : `If a location label is provided, prefer places near that area when possible.`;
 
-    const userContent = `User request:\n${question}\n\nForm parameters for query_travel_places:\n${JSON.stringify(formParams)}\n\nCurrent route:\n${JSON.stringify(buildTripContext())}`;
+    const systemContent = `You are Pathsnap's trip planning engine. First call query_travel_places with the provided form parameters to retrieve shortlisted place names and prices. Then return exactly ONE JSON object, never an array, with no markdown or extra text. Use exactly this shape: {"planTitle":"string","budgetUsd":number|null,"durationDays":number|null,"totalEstimatedHotelCostUsd":number,"withinBudget":boolean|null,"stops":[{"destination":"string","country":"string","nights":number,"hotel":string|null,"pricePerNightUsd":number,"hotelTotalUsd":number}],"notes":["string"]}. ${paceRule} ${radiusRule} Every place the traveler will visit MUST appear in stops — including day trips and places with no overnight stay. For a day visit set nights to 0, hotel to null, pricePerNightUsd to 0, and hotelTotalUsd to 0. Only set a hotel name when booking an overnight stay. The userLocation is only the trip starting point — never list it in stops unless it is also in the shortlist. Use only exact destination and hotel names from the tool results and hotel list. Never invent places, hotels, amenities, or prices.`;
+
+    const routeLines = buildTripContext()
+      .map(stop => `${stop.stop}. ${stop.destination ?? '?'}${stop.stayDurationDays != null ? ` (${stop.stayDurationDays}d)` : ''}`)
+      .join('\n') || '(empty)';
+
+    const userContent = `User request:\n${question}\n\nForm parameters for query_travel_places:\n${JSON.stringify(formParams)}\n\nPriority radius: ${radiusMeters} meters${userLocation?.coords ? ` around ${userLocation.label}` : ''}. Prefer PRIORITY_IN_RADIUS places.\n\nCurrent route:\n${routeLines}`;
 
     const baseMessages = [
       { role: 'system', content: systemContent },
@@ -567,18 +753,7 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
     };
     logAiRequest('trip-plan:tool-call', toolCallPayload);
 
-    const toolResponse = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(toolCallPayload),
-    });
-
-    if (!toolResponse.ok) {
-      throw new Error((await toolResponse.text()) || `Groq tool call failed with status ${toolResponse.status}`);
-    }
+    const toolData = await fetchGroq(apiKey, toolCallPayload, 'trip-plan:tool-call');
 
     type GroqToolMessage = {
       role: string;
@@ -591,10 +766,11 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
       tool_call_id?: string;
     };
 
-    const toolData: { choices?: Array<{ message?: GroqToolMessage }> } = await toolResponse.json();
-    const toolMessage = toolData.choices?.[0]?.message;
+    const toolMessage = toolData.choices?.[0]?.message as GroqToolMessage | undefined;
 
     const conversation: GroqToolMessage[] = [...baseMessages];
+    // Compact tool payload — never re-send the full shortlist JSON twice.
+    const hotelBlock = formatHotelsForPrompt(hotelData);
 
     if (toolMessage?.tool_calls?.length) {
       conversation.push({
@@ -623,6 +799,7 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
         let toolResult: QueryTravelPlacesResult;
         try {
           toolResult = await runQueryTravelPlaces(args);
+          toolResult.places = annotateWithRadius(toolResult.places);
         } catch (toolError) {
           console.warn('[query_travel_places] tool call failed, using precomputed shortlist:', toolError);
           toolResult = {
@@ -634,7 +811,11 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
         conversation.push({
           role: 'tool',
           tool_call_id: call.id,
-          content: JSON.stringify(toolResult),
+          // Compact places only — full JSON objects blow the free-tier token budget.
+          content: JSON.stringify({
+            count: toolResult.count,
+            places: compactPlacesForPrompt(toolResult.places),
+          }),
         });
       }
     } else {
@@ -643,23 +824,15 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
         role: 'tool',
         tool_call_id: 'forced-query',
         content: JSON.stringify({
-          query: formParams,
           count: shortlist.length,
-          places: shortlist,
+          places: compactPlacesForPrompt(shortlist),
         }),
       });
     }
 
-    // Hotel list is only the shortlisted destinations (not the full catalog).
-    const planUserContent = `Retrieved shortlist (names + avg prices):\n${JSON.stringify(shortlist)}\n\nAvailable hotels for those places only:\n${JSON.stringify(hotelData)}\n\nReturn the trip plan JSON now.`;
-
-    // If we already have an assistant tool_calls turn, continue after tool results.
-    // Otherwise append a fresh user turn with the shortlist.
-    if (toolMessage?.tool_calls?.length) {
-      conversation.push({ role: 'user', content: planUserContent });
-    } else {
-      conversation.push({ role: 'user', content: planUserContent });
-    }
+    // Hotels + instruction only. Shortlist is already in the tool turn above.
+    const planUserContent = `Available hotels:\n${hotelBlock}\n\nReturn the trip plan JSON now.`;
+    conversation.push({ role: 'user', content: planUserContent });
 
     const planPayload = {
       model: GROQ_MODEL,
@@ -669,20 +842,7 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
     };
     logAiRequest('trip-plan:final', planPayload);
 
-    const planResponse = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(planPayload),
-    });
-
-    if (!planResponse.ok) {
-      throw new Error((await planResponse.text()) || `Groq plan request failed with status ${planResponse.status}`);
-    }
-
-    const planData: { choices?: Array<{ message?: { content?: string } }> } = await planResponse.json();
+    const planData = await fetchGroq(apiKey, planPayload, 'trip-plan:final');
     const content = planData.choices?.[0]?.message?.content;
     if (!content) throw new Error('Groq returned an empty trip plan.');
 
@@ -731,14 +891,14 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
       let usingLocalFallback = false;
       try {
         const queryResult = await runQueryTravelPlaces(formParams);
-        shortlist = queryResult.places;
+        shortlist = annotateWithRadius(queryResult.places);
       } catch (queryError) {
         console.warn('[query_travel_places] falling back to local names only:', queryError);
         shortlist = buildLocalShortlist();
         usingLocalFallback = true;
       }
 
-      const action = await requestIntent(question);
+      const action = detectLocalIntent(question) ?? (await requestIntent(question));
 
       if (action === 'reject') {
         setMessages(current => [...current, {
@@ -850,11 +1010,12 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
                 Your location
                 <input
                   type="text"
-                  value={queryForm.userLocation}
+                  value={userLocation?.label || queryForm.userLocation}
                   onChange={event => updateQueryForm('userLocation', event.target.value)}
-                  placeholder="e.g. Coblong, Dago, or Jln Diponegoro No 22"
+                  placeholder="e.g. Coblong, Dago, or GPS"
                   className="mt-1 w-full rounded border border-gray-200 px-2 py-1 text-sm"
-                  disabled={isLoading}
+                  disabled={isLoading || Boolean(userLocation)}
+                  title={userLocation ? 'Location set via map/GPS controls above' : undefined}
                 />
               </label>
               <label className="block text-xs text-gray-600">
@@ -906,25 +1067,46 @@ const AITripAssistant: React.FC<AITripAssistantProps> = ({
                       )}
                     </div>
                     <div className="space-y-2">
-                      {message.plan.stops.map((stop, stopIndex) => (
-                        <div key={`${stop.destination}-${stop.hotel ?? 'day'}-${stopIndex}`} className="rounded border border-gray-200 bg-white p-2">
-                          <p className="font-medium text-gray-900">
-                            {stopIndex + 1}. {stop.destination}, {stop.country}
-                          </p>
-                          {stop.hotel && stop.nights > 0 ? (
-                            <>
-                              <p className="text-xs text-gray-600">
-                                {stop.nights} {stop.nights === 1 ? 'night' : 'nights'} at {stop.hotel}
+                      {message.plan.stops.map((stop, stopIndex) => {
+                        const matchedDestination = findDestinationByName(destinations, stop.destination);
+                        return (
+                          <div key={`${stop.destination}-${stop.hotel ?? 'day'}-${stopIndex}`} className="rounded border border-gray-200 bg-white p-2">
+                            <div className="flex items-start justify-between gap-2">
+                              <p className="font-medium text-gray-900">
+                                {stopIndex + 1}. {stop.destination}, {stop.country}
                               </p>
-                              <p className="text-xs text-gray-600">
-                                {formatUsd(stop.pricePerNightUsd)} / night, {formatUsd(stop.hotelTotalUsd)} total
-                              </p>
-                            </>
-                          ) : (
-                            <p className="text-xs text-gray-600">Day visit — no overnight stay</p>
-                          )}
-                        </div>
-                      ))}
+                              {matchedDestination && (
+                                <span className="inline-flex items-center whitespace-nowrap rounded-full bg-yellow-50 px-2 py-0.5 text-xs font-medium text-yellow-800">
+                                  <Star size={12} className="mr-0.5 text-yellow-400 fill-yellow-400" />
+                                  {matchedDestination.rating.toFixed(1)}
+                                </span>
+                              )}
+                            </div>
+                            {stop.hotel && stop.nights > 0 ? (
+                              <>
+                                <p className="text-xs text-gray-600">
+                                  {stop.nights} {stop.nights === 1 ? 'night' : 'nights'} at {stop.hotel}
+                                </p>
+                                <p className="text-xs text-gray-600">
+                                  {formatUsd(stop.pricePerNightUsd)} / night, {formatUsd(stop.hotelTotalUsd)} total
+                                </p>
+                              </>
+                            ) : (
+                              <p className="text-xs text-gray-600">Day visit — no overnight stay</p>
+                            )}
+                            {matchedDestination && (
+                              <button
+                                type="button"
+                                onClick={() => navigate(`/destinations/${matchedDestination.id}`)}
+                                className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-teal-600 hover:text-teal-700 hover:underline"
+                              >
+                                <ExternalLink size={12} />
+                                View details
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                     {message.plan.notes.length > 0 && (
                       <ul className="mt-3 list-disc space-y-1 pl-4 text-xs text-gray-600">

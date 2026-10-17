@@ -6,7 +6,7 @@
  *
  * Usage: node server/queryTravelPlaces.mjs
  * POST /api/query-travel-places
- *   { budgetUsd, userLocation, travelArea, days }
+ *   { budgetUsd, userLocation, travelArea, days, userCoords?, radiusMeters? }
  */
 import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
@@ -254,7 +254,17 @@ function loadAddressIndex() {
   return psql(sql);
 }
 
-async function resolveUserAnchor(userLocation, rows, { areaHint } = {}) {
+async function resolveUserAnchor(userLocation, rows, { areaHint, userCoords } = {}) {
+  // Exact GPS / map-pin coords from the client win over geocoding.
+  if (Array.isArray(userCoords) && userCoords.length === 2 && Number.isFinite(Number(userCoords[0])) && Number.isFinite(Number(userCoords[1]))) {
+    return {
+      kind: 'coords',
+      coords: [Number(userCoords[0]), Number(userCoords[1])],
+      label: userLocation || 'User location',
+      matchedBy: 'client-coords',
+    };
+  }
+
   const needle = String(userLocation || '').trim().toLowerCase();
   if (!needle) return null;
 
@@ -346,10 +356,13 @@ async function resolveUserAnchor(userLocation, rows, { areaHint } = {}) {
   return { kind: 'text', label: userLocation, weakMatch: best.score > 0 ? best : undefined };
 }
 
-function rankPlaces(rows, { budgetUsd, userLocation }, anchor) {
+function rankPlaces(rows, { budgetUsd, userLocation, radiusMeters }, anchor) {
   const budget = Number(budgetUsd);
   const hasBudget = Number.isFinite(budget) && budget > 0;
   const resolvedAnchor = anchor;
+  const radiusM = Number.isFinite(Number(radiusMeters)) && Number(radiusMeters) > 0
+    ? Number(radiusMeters)
+    : 5000;
 
   const enriched = rows.map(enrichFromMock).map((row) => {
     const coords =
@@ -358,12 +371,15 @@ function rankPlaces(rows, { budgetUsd, userLocation }, anchor) {
         : row._mockCoords || null;
 
     let sameArea = false;
+    let inRadius = false;
     let distanceKm = null;
 
     if (resolvedAnchor?.kind === 'coords' && coords) {
-      distanceKm = haversineKm(resolvedAnchor.coords, coords);
-      // "Same district/city" proxy: within ~5 km of the user's anchor.
-      sameArea = distanceKm <= 5;
+      const meters = haversineKm(resolvedAnchor.coords, coords) * 1000;
+      distanceKm = meters / 1000;
+      inRadius = meters <= radiusM;
+      // "Same district/city" proxy: within the user's prioritization radius.
+      sameArea = inRadius;
     } else if (resolvedAnchor?.kind === 'area') {
       sameArea =
         (resolvedAnchor.district && row.district && resolvedAnchor.district === row.district) ||
@@ -390,23 +406,27 @@ function rankPlaces(rows, { budgetUsd, userLocation }, anchor) {
       district: row.district || null,
       city: row.city || null,
       sameArea,
+      inRadius,
       distanceKm: distanceKm != null ? Math.round(distanceKm * 100) / 100 : null,
       affordableAttractions,
     };
   });
 
-  // Prioritize: can afford all attractions → same area (closest) → else highest rating.
+  // Prioritize: in radius (closest) → can afford attractions → rating.
   enriched.sort((a, b) => {
+    if (a.inRadius !== b.inRadius) {
+      return a.inRadius ? -1 : 1;
+    }
+    if (a.inRadius && b.inRadius) {
+      const da = a.distanceKm ?? Number.POSITIVE_INFINITY;
+      const db = b.distanceKm ?? Number.POSITIVE_INFINITY;
+      if (da !== db) return da - db;
+    }
     if (a.affordableAttractions !== b.affordableAttractions) {
       return a.affordableAttractions ? -1 : 1;
     }
     if (a.sameArea !== b.sameArea) {
       return a.sameArea ? -1 : 1;
-    }
-    if (a.sameArea && b.sameArea) {
-      const da = a.distanceKm ?? Number.POSITIVE_INFINITY;
-      const db = b.distanceKm ?? Number.POSITIVE_INFINITY;
-      if (da !== db) return da - db;
     }
     const ra = a.rating ?? -1;
     const rb = b.rating ?? -1;
@@ -417,7 +437,7 @@ function rankPlaces(rows, { budgetUsd, userLocation }, anchor) {
   return enriched;
 }
 
-async function queryTravelPlaces({ budgetUsd, userLocation, travelArea, days }) {
+async function queryTravelPlaces({ budgetUsd, userLocation, travelArea, days, userCoords, radiusMeters }) {
   const area = String(travelArea || '').trim();
   const areaFilter = area
     ? `AND (
@@ -473,11 +493,14 @@ async function queryTravelPlaces({ budgetUsd, userLocation, travelArea, days }) 
   `;
 
   const rows = psql(sql);
-  const anchor = await resolveUserAnchor(userLocation, rows, { areaHint: area || travelArea });
-  const ranked = rankPlaces(rows, { budgetUsd, userLocation }, anchor);
+  const anchor = await resolveUserAnchor(userLocation, rows, {
+    areaHint: area || travelArea,
+    userCoords,
+  });
+  const ranked = rankPlaces(rows, { budgetUsd, userLocation, radiusMeters }, anchor);
 
   return {
-    query: { budgetUsd, userLocation, travelArea, days },
+    query: { budgetUsd, userLocation, travelArea, days, userCoords, radiusMeters },
     count: ranked.length,
     anchor,
     places: ranked.slice(0, 15),

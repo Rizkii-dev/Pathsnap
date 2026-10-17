@@ -1,3 +1,12 @@
+export interface Review {
+  id: string;
+  destinationId: string;
+  author: string;
+  rating: number;
+  comment: string;
+  date: string;
+}
+
 export interface Destination {
   id: string;
   name: string;
@@ -61,3 +70,14 @@ export type FilterOptions = {
   priceRange?: number[];
   searchQuery?: string;
 };
+
+/** Resolved traveler anchor used for radius prioritization on the map and in AI planning. */
+export interface UserLocation {
+  /** null when only a free-text place name is known (no GPS / map pin yet). */
+  coords: [number, number] | null;
+  label: string;
+  source: 'gps' | 'manual' | 'map';
+  accuracyM?: number;
+}
+
+export type RadiusUnit = 'm' | 'km';

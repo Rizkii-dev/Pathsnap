@@ -3,18 +3,32 @@ import { useLocation } from 'react-router-dom';
 import MapView from '../components/planner/MapView';
 import RouteSidebar from '../components/planner/RouteSidebar';
 import AITripAssistant from '../components/planner/AITripAssistant';
+import LocationControls from '../components/planner/LocationControls';
 import { destinations, accommodations, attractions } from '../data/mockData';
-import { RoutePoint, Destination } from '../types';
+import { RoutePoint, Destination, RadiusUnit, UserLocation } from '../types';
 import { generateUniqueId, calculateTotalCost, calculateTotalDuration } from '../utils/helpers';
 import { TripPlanResponse } from '../components/planner/AITripAssistant';
 
 const PlanTripPage: React.FC = () => {
   const location = useLocation();
   const initialDestinationId = location.state?.destinationId;
-  
+
   const [selectedDestinations, setSelectedDestinations] = useState<RoutePoint[]>([]);
   const [totalCost, setTotalCost] = useState(0);
   const [totalDuration, setTotalDuration] = useState(0);
+  const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
+  const [radiusMeters, setRadiusMeters] = useState(2000);
+  const [radiusUnit, setRadiusUnit] = useState<RadiusUnit>('km');
+  const [isPickingOnMap, setIsPickingOnMap] = useState(false);
+
+  const handleMapPickLocation = (coords: [number, number]) => {
+    setUserLocation({
+      coords,
+      label: 'Pinned location',
+      source: 'map',
+    });
+    setIsPickingOnMap(false);
+  };
   
   // If a destination ID is provided in location state, add it to the route
   useEffect(() => {
@@ -159,12 +173,28 @@ const PlanTripPage: React.FC = () => {
       </div>
       
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2 h-[600px]">
-          <MapView 
-            destinations={destinations}
-            selectedDestinations={selectedDestinations}
-            onDestinationSelect={handleAddDestination}
+        <div className="lg:col-span-2 flex flex-col gap-4">
+          <LocationControls
+            userLocation={userLocation}
+            radiusMeters={radiusMeters}
+            radiusUnit={radiusUnit}
+            isPickingOnMap={isPickingOnMap}
+            onUserLocationChange={setUserLocation}
+            onRadiusMetersChange={setRadiusMeters}
+            onRadiusUnitChange={setRadiusUnit}
+            onPickingOnMapChange={setIsPickingOnMap}
           />
+          <div className="h-[600px]">
+            <MapView
+              destinations={destinations}
+              selectedDestinations={selectedDestinations}
+              onDestinationSelect={handleAddDestination}
+              userLocation={userLocation}
+              radiusMeters={radiusMeters}
+              isPickingOnMap={isPickingOnMap}
+              onMapPickLocation={handleMapPickLocation}
+            />
+          </div>
         </div>
         <div className="flex flex-col gap-6">
           <AITripAssistant
@@ -172,6 +202,8 @@ const PlanTripPage: React.FC = () => {
             destinations={destinations}
             accommodations={accommodations}
             attractions={attractions}
+            userLocation={userLocation}
+            radiusMeters={radiusMeters}
             onApplyPlan={handleApplyPlan}
           />
           <div className="h-[600px]">

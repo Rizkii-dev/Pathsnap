@@ -1,17 +1,19 @@
 import React from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { MapPin, Star, Hotel, Map, Calendar, DollarSign, Globe, Thermometer, PlusCircle } from 'lucide-react';
+import { MapPin, Star, Hotel, Map, Calendar, DollarSign, Globe, Thermometer, PlusCircle, MessageSquareQuote } from 'lucide-react';
 import Button from '../components/ui/Button';
+import StarRating from '../components/ui/StarRating';
 import { destinations, accommodations, attractions } from '../data/mockData';
-import { formatCurrency } from '../utils/helpers';
+import { getReviewSummary } from '../data/reviews';
+import { formatCurrency, getPlaceLocation } from '../utils/helpers';
 
 const DestinationDetailPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  
+
   const destination = destinations.find(dest => dest.id === id);
-  
+
   if (!destination) {
     return (
       <div className="container mx-auto px-4 py-12 text-center">
@@ -23,10 +25,12 @@ const DestinationDetailPage: React.FC = () => {
       </div>
     );
   }
-  
+
   // Get accommodations and attractions for this destination
   const destinationAccommodations = accommodations.filter(acc => acc.destinationId === destination.id);
   const destinationAttractions = attractions.filter(attr => attr.destinationId === destination.id);
+  const locationLabel = getPlaceLocation(destination);
+  const reviewSummary = getReviewSummary(destination.id, destination.name, destination.rating);
   
   return (
     <div>
@@ -45,12 +49,17 @@ const DestinationDetailPage: React.FC = () => {
             >
               {destination.name}
             </motion.h1>
-            <div className="flex items-center text-white mb-4">
-              <MapPin size={16} className="mr-1" />
-              <span>{destination.country}</span>
-              <div className="mx-3 h-5 border-l border-white opacity-30"></div>
-              <Star size={16} className="text-yellow-400 mr-1" />
-              <span>{destination.rating} rating</span>
+            <div className="flex flex-wrap items-center text-white mb-4 gap-x-3 gap-y-1">
+              <span className="inline-flex items-center">
+                <MapPin size={16} className="mr-1" />
+                {locationLabel}
+              </span>
+              <div className="hidden sm:block h-5 border-l border-white opacity-30"></div>
+              <span className="inline-flex items-center">
+                <Star size={16} className="text-yellow-400 mr-1 fill-yellow-400" />
+                <span>{destination.rating.toFixed(1)}</span>
+                <span className="opacity-80 ml-1">({reviewSummary.count} reviews)</span>
+              </span>
             </div>
             <div className="flex space-x-3">
               <span className="bg-teal-600 text-white px-3 py-1 rounded-full text-sm font-medium inline-flex items-center">
@@ -127,7 +136,60 @@ const DestinationDetailPage: React.FC = () => {
                 </div>
               </div>
             </div>
-            
+
+            {/* Reviews */}
+            <div className="bg-white rounded-lg shadow-md p-6 mb-8">
+              <h2 className="text-2xl font-semibold mb-4 flex items-center">
+                <MessageSquareQuote size={20} className="mr-2 text-teal-600" />
+                Reviews
+              </h2>
+
+              <div className="flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-8 mb-6 pb-6 border-b border-gray-100">
+                <div className="text-center sm:text-left">
+                  <p className="text-4xl font-bold text-gray-900">{destination.rating.toFixed(1)}</p>
+                  <StarRating rating={destination.rating} size={18} showValue={false} className="mt-1 justify-center sm:justify-start" />
+                  <p className="text-sm text-gray-500 mt-1">{reviewSummary.count} reviews</p>
+                </div>
+                <div className="flex-1 space-y-1">
+                  {[5, 4, 3, 2, 1].map(star => {
+                    const count = reviewSummary.reviews.filter(review => Math.round(review.rating) === star).length;
+                    const pct = reviewSummary.reviews.length > 0
+                      ? (count / reviewSummary.reviews.length) * 100
+                      : 0;
+                    return (
+                      <div key={star} className="flex items-center gap-2 text-xs text-gray-600">
+                        <span className="w-8">{star} ★</span>
+                        <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
+                          <div className="h-full bg-yellow-400 rounded-full" style={{ width: `${pct}%` }} />
+                        </div>
+                        <span className="w-6 text-right">{count}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <ul className="space-y-5">
+                {reviewSummary.reviews.map(review => (
+                  <li key={review.id} className="border-b border-gray-50 pb-5 last:border-0 last:pb-0">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-full bg-teal-100 text-teal-700 flex items-center justify-center font-semibold text-sm">
+                          {review.author.split(' ').map(part => part[0]).slice(0, 2).join('')}
+                        </div>
+                        <div>
+                          <p className="font-medium text-gray-900">{review.author}</p>
+                          <StarRating rating={review.rating} size={14} showValue={false} />
+                        </div>
+                      </div>
+                      <time className="text-xs text-gray-500 whitespace-nowrap">{review.date}</time>
+                    </div>
+                    <p className="mt-2 text-sm text-gray-700 leading-relaxed">{review.comment}</p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
             {/* Accommodations */}
             <div className="bg-white rounded-lg shadow-md p-6 mb-8">
               <h2 className="text-2xl font-semibold mb-4 flex items-center">
