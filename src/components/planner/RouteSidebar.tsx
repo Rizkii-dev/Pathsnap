@@ -1,7 +1,7 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Destination, RoutePoint, Accommodation, Attraction } from '../../types';
-import { MapPin, Hotel, Map, Trash2, Plus, Calendar, DollarSign } from 'lucide-react';
+import { MapPin, Hotel, Map, Trash2, Plus, Calendar, DollarSign, Star } from 'lucide-react';
 import Button from '../ui/Button';
 import { formatCurrency } from '../../utils/helpers';
 
@@ -154,9 +154,15 @@ const RouteSidebar: React.FC<RouteSidebarProps> = ({
                               </div>
                               <div className="flex-1 min-w-0">
                                 <p className="text-sm font-medium truncate">{accommodation.name}</p>
-                                <p className="text-xs text-gray-500">
-                                  {formatCurrency(accommodation.price)} / night
-                                </p>
+                                <div className="flex items-center text-xs text-gray-500">
+                                  <Star size={12} className="text-yellow-400 mr-0.5" />
+                                  <span>{accommodation.rating > 0 ? accommodation.rating.toFixed(1) : '—'}</span>
+                                  {accommodation.ratingCount > 0 && (
+                                    <span className="ml-0.5">({accommodation.ratingCount.toLocaleString()})</span>
+                                  )}
+                                  <span className="mx-1">·</span>
+                                  <span>{accommodation.price > 0 ? `${formatCurrency(accommodation.price)} / night` : 'Price unavailable'}</span>
+                                </div>
                               </div>
                             </div>
                           ))}
@@ -201,9 +207,15 @@ const RouteSidebar: React.FC<RouteSidebarProps> = ({
                               </div>
                               <div className="flex-1 min-w-0">
                                 <p className="text-sm font-medium truncate">{attraction.name}</p>
-                                <p className="text-xs text-gray-500">
-                                  {attraction.price ? formatCurrency(attraction.price) : 'Free'}
-                                </p>
+                                <div className="flex items-center text-xs text-gray-500">
+                                  <Star size={12} className="text-yellow-400 mr-0.5" />
+                                  <span>{attraction.rating > 0 ? attraction.rating.toFixed(1) : '—'}</span>
+                                  {attraction.ratingCount > 0 && (
+                                    <span className="ml-0.5">({attraction.ratingCount.toLocaleString()})</span>
+                                  )}
+                                  <span className="mx-1">·</span>
+                                  <span>{attraction.price ? formatCurrency(attraction.price) : 'Free'}</span>
+                                </div>
                               </div>
                               <div className="ml-2">
                                 {routePoint.selectedAttractions.includes(attraction.id) ? (

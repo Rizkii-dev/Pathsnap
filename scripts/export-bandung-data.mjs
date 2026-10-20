@@ -1,27 +1,22 @@
 #!/usr/bin/env node
 /**
- * Export Bandung data from local WSL Postgres (`pathsnap`) into
+ * Export Bandung data from `src/data/new_data.sql` (pg_dump) into
  * `src/data/mockData.ts`, keeping the existing Destination/Accommodation/Attraction shapes.
+ *
+ * Uses real rating_avg / rating_count / price data from the dump — no synthetic fallbacks.
  *
  * Usage: node scripts/export-bandung-data.mjs
  */
-import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
+const SQL_FILE = join(ROOT, 'src', 'data', 'new_data.sql');
 const OUT = join(ROOT, 'src', 'data', 'mockData.ts');
 
-function psql(sql) {
-  const out = execFileSync(
-    'wsl',
-    ['-d', 'Ubuntu', '-u', 'root', '--', 'sudo', '-u', 'postgres', 'psql', '-d', 'pathsnap', '-t', '-A', '-v', 'ON_ERROR_STOP=1', '-c', sql],
-    { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
-  );
-  return JSON.parse(out.trim() || '[]');
-}
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 function haversineKm(a, b) {
   const R = 6371;
@@ -35,6 +30,67 @@ function haversineKm(a, b) {
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(h));
 }
+
+/** Decode PostGIS hex-WKB Point(4326) → [lng, lat] */
+function decodeWkbPoint(hex) {
+  if (!hex || hex === '\\N' || hex.length < 50) return null;
+  // Skip 18 hex chars (9 bytes: byte-order + type + SRID)
+  const xHex = hex.slice(18, 34); // longitude, double LE
+  const yHex = hex.slice(34, 50); // latitude, double LE
+  const bufX = Buffer.from(xHex, 'hex');
+  const bufY = Buffer.from(yHex, 'hex');
+  return [bufX.readDoubleLE(0), bufY.readDoubleLE(0)];
+}
+
+function parseVal(v) {
+  if (v === '\\N' || v === '') return null;
+  return v;
+}
+
+function parseNum(v) {
+  const s = parseVal(v);
+  if (s == null) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseInt(v) {
+  const s = parseVal(v);
+  if (s == null) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+// ── SQL dump parser ──────────────────────────────────────────────────────────
+
+function parseCopyBlock(sql, tableName) {
+  const re = new RegExp(`COPY public\\.${tableName} \\([^)]+\\) FROM stdin;\\n([\\s\\S]*?)\\n\\\\\\.`, 'm');
+  const m = sql.match(re);
+  if (!m) return [];
+  return m[1].split('\n').filter((l) => l.trim() !== '');
+}
+
+function parseColumns(sql, tableName) {
+  const re = new RegExp(`COPY public\\.${tableName} \\(([^)]+)\\) FROM stdin;`, 'm');
+  const m = sql.match(re);
+  if (!m) return [];
+  return m[1].split(',').map((c) => c.trim());
+}
+
+function rowsToObjects(sql, tableName) {
+  const cols = parseColumns(sql, tableName);
+  const lines = parseCopyBlock(sql, tableName);
+  return lines.map((line) => {
+    const fields = line.split('\t');
+    const obj = {};
+    for (let i = 0; i < cols.length; i++) {
+      obj[cols[i]] = fields[i] ?? '\\N';
+    }
+    return obj;
+  });
+}
+
+// ── category / type mapping (same as before) ─────────────────────────────────
 
 const CATEGORY_IMAGE = {
   waterfall: 'https://images.pexels.com/photos/1450353/pexels-photo-1450353.jpeg',
@@ -109,77 +165,59 @@ function mapPriceRange(level) {
   }
 }
 
-function priceForAccommodation(type, starClass) {
-  const base = {
-    hotel: 45,
-    hostel: 18,
-    resort: 90,
-    apartment: 60,
-  }[type] ?? 45;
-  if (starClass) return Math.round(base * (0.7 + starClass * 0.15) * 10) / 10;
-  return base;
-}
-
-function fallbackDescription(name, address, categoryName, country) {
+function fallbackDescription(name, address, categoryName) {
   if (address) return `${name} in Bandung, Indonesia — ${address}.`;
   return `${name} is a ${categoryName || 'hidden gem'} in Bandung, Indonesia.`;
 }
 
-function stableRating(id) {
-  // Deterministic 4.0–4.9 placeholder when DB has no rating
-  return Math.round((4 + ((id * 37) % 10) / 10) * 10) / 10;
+// ── load SQL dump ────────────────────────────────────────────────────────────
+
+// new_data.sql is UTF-16 LE (pg_dump on Windows); detect via BOM
+const rawBuf = readFileSync(SQL_FILE);
+let sql = rawBuf[0] === 0xff && rawBuf[1] === 0xfe
+  ? rawBuf.toString('utf16le').replace(/^\uFEFF/, '')
+  : rawBuf.toString('utf8');
+// Normalize Windows line endings
+sql = sql.replace(/\r\n/g, '\n');
+
+const categoryRows = rowsToObjects(sql, 'categories');
+const categoryMap = {};
+for (const c of categoryRows) {
+  const id = parseInt(c.id);
+  categoryMap[id] = { name: parseVal(c.name), slug: parseVal(c.slug) };
 }
 
-const places = psql(`
-  SELECT coalesce(json_agg(json_build_object(
-    'id', p.id,
-    'slug', p.slug,
-    'name', p.name,
-    'description', p.description,
-    'address', p.address,
-    'category_id', p.category_id,
-    'category_slug', c.slug,
-    'category_name', c.name,
-    'latitude', p.latitude,
-    'longitude', p.longitude,
-    'rating_avg', p.rating_avg,
-    'price_level', p.price_level,
-    'is_hidden_gem', p.is_hidden_gem
-  ) ORDER BY p.id), '[]'::json)
-  FROM places p
-  LEFT JOIN categories c ON c.id = p.category_id
-  WHERE p.is_active
-`);
+const placeRows = rowsToObjects(sql, 'places');
+const accRows = rowsToObjects(sql, 'accommodations');
 
-const accommodations = psql(`
-  SELECT coalesce(json_agg(json_build_object(
-    'id', a.id,
-    'slug', a.slug,
-    'name', a.name,
-    'description', a.description,
-    'type', a.type::text,
-    'star_class', a.star_class,
-    'address', a.address,
-    'latitude', a.latitude,
-    'longitude', a.longitude,
-    'rating_avg', a.rating_avg,
-    'price_per_night_min', a.price_per_night_min,
-    'price_per_night_max', a.price_per_night_max,
-    'price_level', a.price_level::text,
-    'amenities', (
-      SELECT coalesce(json_agg(am.name ORDER BY am.name), '[]'::json)
-      FROM accommodation_amenities aa
-      JOIN amenities am ON am.id = aa.amenity_id
-      WHERE aa.accommodation_id = a.id
-    )
-  ) ORDER BY a.id), '[]'::json)
-  FROM accommodations a
-  WHERE a.is_active
-`);
+console.log(`Parsed ${placeRows.length} places, ${accRows.length} accommodations, ${categoryRows.length} categories from new_data.sql`);
 
-console.log(`Loaded ${places.length} places, ${accommodations.length} accommodations`);
+// ── build places ─────────────────────────────────────────────────────────────
 
-const placeCoords = places.map((p) => [Number(p.latitude), Number(p.longitude)]);
+const places = placeRows.map((r) => {
+  const coords = decodeWkbPoint(r.location);
+  const cat = categoryMap[parseInt(r.category_id)] || { name: 'Other', slug: 'other' };
+  return {
+    id: parseInt(r.id),
+    slug: parseVal(r.slug),
+    name: parseVal(r.name),
+    description: parseVal(r.description),
+    address: parseVal(r.address),
+    category_id: parseInt(r.category_id),
+    category_slug: cat.slug,
+    category_name: cat.name,
+    latitude: coords ? coords[1] : null,
+    longitude: coords ? coords[0] : null,
+    rating_avg: parseNum(r.rating_avg),
+    rating_count: parseInt(r.rating_count) ?? 0,
+    price_min: parseNum(r.price_min),
+    price_max: parseNum(r.price_max),
+    price_level: parseVal(r.price_level),
+    is_hidden_gem: parseVal(r.is_hidden_gem) === 't',
+  };
+});
+
+const placeCoords = places.map((p) => [p.latitude, p.longitude]);
 
 function nearestPlace(fromCoord, excludeId, limit) {
   const scored = [];
@@ -195,70 +233,60 @@ function nearestPlace(fromCoord, excludeId, limit) {
 }
 
 const destinations = places.map((p) => {
-  const lat = Number(p.latitude) ?? -6.9175;
-  const lng = Number(p.longitude) ?? 107.6191;
+  const lat = p.latitude ?? -6.9175;
+  const lng = p.longitude ?? 107.6191;
   return {
     id: `dest-${p.id}`,
     name: p.name,
     country: 'Indonesia',
     description:
       (p.description && String(p.description).trim()) ||
-      fallbackDescription(p.name, p.address, p.category_name, 'Indonesia'),
+      fallbackDescription(p.name, p.address, p.category_name),
     image: CATEGORY_IMAGE[p.category_slug] || CATEGORY_IMAGE.other,
-    rating: p.rating_avg != null ? Number(p.rating_avg) : stableRating(p.id),
+    rating: p.rating_avg ?? 0,
+    ratingCount: p.rating_count,
     region: 'Asia',
     climate: 'Tropical',
     priceRange: mapPriceRange(p.price_level),
     coordinates: [lat, lng],
-    // extras kept out of TS type but useful later
-    _category: p.category_name || 'Other',
-    _address: p.address || '',
-    _hiddenGem: Boolean(p.is_hidden_gem),
   };
 });
 
-const accommodationOut = accommodations.map((a) => {
-  const lat = Number(a.latitude) ?? -6.9175;
-  const lng = Number(a.longitude) ?? 107.6191;
+// ── build accommodations ─────────────────────────────────────────────────────
+
+const accommodationOut = accRows.map((a) => {
+  const coords = decodeWkbPoint(a.location);
+  const lat = coords ? coords[1] : -6.9175;
+  const lng = coords ? coords[0] : 107.6191;
   const type = mapAccommodationType(a.type);
   const nearest = nearestPlace([lat, lng], null, 1);
   const destinationId = nearest[0] ? `dest-${nearest[0].id}` : 'dest-1';
-  const amenities =
-    Array.isArray(a.amenities) && a.amenities.length > 0
-      ? a.amenities
-      : type === 'hostel'
-        ? ['Wi-Fi', 'Shared kitchen', 'Lockers']
-        : type === 'resort'
-          ? ['Pool', 'Restaurant', 'Wi-Fi']
-          : type === 'apartment'
-            ? ['Kitchen', 'Wi-Fi', 'Laundry']
-            : ['Wi-Fi', 'Parking', 'Air conditioning'];
 
   return {
     id: `acc-${a.id}`,
-    name: a.name,
+    name: parseVal(a.name),
     description:
       (a.description && String(a.description).trim()) ||
       `${a.name} is a ${type} in Bandung, Indonesia${a.address ? ` (${a.address})` : ''}.`,
     image: ACC_IMAGE[type] || ACC_IMAGE.default,
-    price:
-      a.price_per_night_min != null
-        ? Number(a.price_per_night_min)
-        : priceForAccommodation(type, a.star_class),
-    rating: a.rating_avg != null ? Number(a.rating_avg) : stableRating(a.id + 1000),
+    price: parseNum(a.price_per_night_min) ?? 0,
+    rating: parseNum(a.rating_avg) ?? 0,
+    ratingCount: parseInt(a.rating_count) ?? 0,
     type,
-    amenities,
+    amenities: ['Wi-Fi', 'Parking', 'Air conditioning'],
     coordinates: [lat, lng],
     destinationId,
   };
 });
 
-// For each destination, expose ~5 nearby other places as attractions ("things to do").
+// ── build attractions ────────────────────────────────────────────────────────
+
 const attractions = [];
 for (let i = 0; i < places.length; i++) {
   const dest = places[i];
   const destId = `dest-${dest.id}`;
-  const from = [Number(dest.latitude), Number(dest.longitude)];
+  const from = [dest.latitude, dest.longitude];
+  if (from[0] == null || from[1] == null) continue;
   const nearby = nearestPlace(from, dest.id, 5);
   for (const n of nearby) {
     const p = places[n.index];
@@ -267,16 +295,19 @@ for (let i = 0; i < places.length; i++) {
       name: p.name,
       description:
         (p.description && String(p.description).trim()) ||
-        fallbackDescription(p.name, p.address, p.category_name, 'Indonesia'),
+        fallbackDescription(p.name, p.address, p.category_name),
       image: CATEGORY_IMAGE[p.category_slug] || CATEGORY_IMAGE.other,
       type: mapAttractionType(p.category_slug),
-      rating: p.rating_avg != null ? Number(p.rating_avg) : stableRating(p.id + 2000),
-      price: null,
-      coordinates: [Number(p.latitude), Number(p.longitude)],
+      rating: p.rating_avg ?? 0,
+      ratingCount: p.rating_count,
+      price: p.price_min ?? null,
+      coordinates: [p.latitude, p.longitude],
       destinationId: destId,
     });
   }
 }
+
+// ── emit TypeScript ──────────────────────────────────────────────────────────
 
 function tsString(v) {
   return JSON.stringify(v ?? '');
@@ -290,14 +321,6 @@ function tsNumber(v) {
   return Number.isFinite(v) ? String(v) : '0';
 }
 
-function tsStringArray(arr) {
-  return `[${arr.map((x) => tsString(x)).join(', ')}]`;
-}
-
-function tsPriceRange(v) {
-  return String(v);
-}
-
 const destLines = destinations.map((d) => `  {
     id: ${tsString(d.id)},
     name: ${tsString(d.name)},
@@ -305,9 +328,10 @@ const destLines = destinations.map((d) => `  {
     description: ${tsString(d.description)},
     image: ${tsString(d.image)},
     rating: ${tsNumber(d.rating)},
+    ratingCount: ${tsNumber(d.ratingCount)},
     region: ${tsString(d.region)},
     climate: ${tsString(d.climate)},
-    priceRange: ${tsPriceRange(d.priceRange)} as const,
+    priceRange: ${d.priceRange} as const,
     coordinates: ${tsCoord(d.coordinates)}
   }`);
 
@@ -318,8 +342,9 @@ const accLines = accommodationOut.map((a) => `  {
     image: ${tsString(a.image)},
     price: ${tsNumber(a.price)},
     rating: ${tsNumber(a.rating)},
+    ratingCount: ${tsNumber(a.ratingCount)},
     type: ${tsString(a.type)},
-    amenities: ${tsStringArray(a.amenities)},
+    amenities: [${a.amenities.map((x) => tsString(x)).join(', ')}],
     coordinates: ${tsCoord(a.coordinates)},
     destinationId: ${tsString(a.destinationId)}
   }`);
@@ -331,7 +356,8 @@ const attrLines = attractions.map((a) => `  {
     image: ${tsString(a.image)},
     type: ${tsString(a.type)},
     rating: ${tsNumber(a.rating)},
-    price: null,
+    ratingCount: ${tsNumber(a.ratingCount)},
+    price: ${a.price != null ? tsNumber(a.price) : 'null'},
     coordinates: ${tsCoord(a.coordinates)},
     destinationId: ${tsString(a.destinationId)}
   }`);
@@ -339,7 +365,7 @@ const attrLines = attractions.map((a) => `  {
 const content = `import { Destination, Accommodation, Attraction } from '../types';
 
 /**
- * Real Bandung data exported from PostgreSQL (pathsnap DB).
+ * Real Bandung data exported from new_data.sql (PostgreSQL dump).
  * Generated by scripts/export-bandung-data.mjs — do not edit by hand.
  */
 

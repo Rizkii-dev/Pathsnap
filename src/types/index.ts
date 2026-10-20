@@ -14,6 +14,7 @@ export interface Destination {
   description: string;
   image: string;
   rating: number;
+  ratingCount: number;
   region: string;
   climate: string;
   priceRange: 1 | 2 | 3; // 1 = Budget, 2 = Mid-range, 3 = Luxury
@@ -27,6 +28,7 @@ export interface Accommodation {
   image: string;
   price: number;
   rating: number;
+  ratingCount: number;
   type: 'hotel' | 'hostel' | 'resort' | 'apartment';
   amenities: string[];
   coordinates: [number, number];
@@ -40,6 +42,7 @@ export interface Attraction {
   image: string;
   type: 'cultural' | 'natural' | 'entertainment' | 'historical';
   rating: number;
+  ratingCount: number;
   price: number | null; // null if free
   coordinates: [number, number];
   destinationId: string;

@@ -31,6 +31,9 @@ const DestinationCard: React.FC<DestinationCardProps> = ({ destination }) => {
         <div className="absolute top-4 right-4 bg-white bg-opacity-90 rounded-full py-1 px-2 flex items-center">
           <Star size={16} className="text-yellow-400 mr-1" />
           <span className="text-sm font-medium">{destination.rating}</span>
+          {destination.ratingCount > 0 && (
+            <span className="text-xs text-gray-500 ml-1">({destination.ratingCount.toLocaleString()})</span>
+          )}
         </div>
         <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black to-transparent h-16"></div>
       </div>
